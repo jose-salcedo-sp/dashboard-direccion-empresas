@@ -34,6 +34,9 @@ MES_ORDER = [
     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ]
 
+CAT_MO = "GASTOS DE MANO DE OBRA"
+CAT_FIN = "GASTOS FINANCIEROS"
+
 st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap');
@@ -352,7 +355,47 @@ def load_summary():
     df["Utilidad"] = df["Ventas"] - df["Gastos"] - df["Costos"]
     df["Margen_Pct"] = (df["Utilidad"] / df["Ventas"] * 100).round(2)
     df["Mes"] = pd.Categorical(df["Mes"], categories=MES_ORDER, ordered=True)
-    return df.sort_values("Mes_Num").reset_index(drop=True)
+    df = df.sort_values("Mes_Num").reset_index(drop=True)
+    return enrich_monthly(df, raw)
+
+
+def enrich_monthly(df, raw):
+    mo = (
+        raw[raw["Categoria"] == CAT_MO]
+        .groupby(["Mes", "Mes_Num"], as_index=False)["Monto"]
+        .sum()
+        .rename(columns={"Monto": "ManoObra"})
+    )
+    fin = (
+        raw[raw["Categoria"] == CAT_FIN]
+        .groupby(["Mes", "Mes_Num"], as_index=False)["Monto"]
+        .sum()
+        .rename(columns={"Monto": "GastosFin"})
+    )
+    intereses = (
+        raw[(raw["Categoria"] == CAT_FIN) & (raw["Concepto"] == "INTERESES")]
+        .groupby(["Mes", "Mes_Num"], as_index=False)["Monto"]
+        .sum()
+        .rename(columns={"Monto": "Intereses"})
+    )
+    out = df.merge(mo, on=["Mes", "Mes_Num"], how="left")
+    out = out.merge(fin, on=["Mes", "Mes_Num"], how="left")
+    out = out.merge(intereses, on=["Mes", "Mes_Num"], how="left")
+    for col in ("ManoObra", "GastosFin", "Intereses"):
+        out[col] = out[col].fillna(0)
+
+    out["Margen_Neto_Pct"] = (out["Utilidad"] / out["Ventas"] * 100).round(2)
+    out["Margen_Bruto_Pct"] = ((out["Ventas"] - out["Costos"]) / out["Ventas"] * 100).round(2)
+    out["Pct_MP"] = (out["Costos"] / out["Ventas"] * 100).round(2)
+    out["Pct_MO"] = (out["ManoObra"] / out["Ventas"] * 100).round(2)
+    out["Pct_Fin"] = (out["GastosFin"] / out["Ventas"] * 100).round(2)
+    out["EBITDA"] = out["Utilidad"] + out["Intereses"]
+    out["EBITDA_Pct"] = (out["EBITDA"] / out["Ventas"] * 100).round(2)
+    out["ROI_Pct"] = (out["Utilidad"] / (out["Costos"] + out["Gastos"]) * 100).round(2)
+    mc = (out["Ventas"] - out["Costos"]) / out["Ventas"]
+    out["Break_Even"] = (out["Gastos"] / mc).where(mc > 0)
+    out["MoM_Ventas"] = (out["Ventas"].pct_change() * 100).round(1)
+    return out
 
 
 def fmt(v):
@@ -405,6 +448,12 @@ def base_layout(fig, height=360, legend=True):
     return fig
 
 
+def pct_layout(fig, height=360, legend=True):
+    fig = base_layout(fig, height=height, legend=legend)
+    fig.update_yaxes(tickprefix="", ticksuffix="%", tickformat=".1f")
+    return fig
+
+
 def kpi_card(label, value, sub, accent, icon, icon_bg, small=False):
     cls = "kpi-card kpi-card-sm" if small else "kpi-card"
     return f"""
@@ -428,14 +477,17 @@ def render_kpi_section(title, cards, cols=4, small=False):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def compute_kpis(dff, raw, sel_nums):
+def compute_kpis(dff, raw, sel_nums, full_df):
     n = len(dff)
     empty = {
         "t_ventas": 0, "t_gastos": 0, "t_costos": 0, "t_egresos": 0, "t_utilidad": 0,
-        "margen_bruto": 0, "margen_contrib": 0, "pct_mp": 0, "pct_gastos": 0, "pct_egresos": 0,
-        "prom_ventas": 0, "prom_utilidad": 0, "best_mes": "—", "worst_mes": "—",
-        "best_util": 0, "worst_util": 0, "meses_positivos": 0, "n_meses": 0,
-        "top_rubro": "—", "top_rubro_pct": 0, "mom_ventas": None,
+        "margen_neto": 0, "margen_bruto": 0, "pct_mp": 0, "pct_mo": 0, "pct_fin": 0,
+        "pct_gastos": 0, "pct_egresos": 0, "ebitda": 0, "ebitda_pct": 0, "roi": 0,
+        "prom_ventas": 0, "prom_utilidad": 0, "prom_be": 0,
+        "best_mes": "—", "worst_mes": "—", "best_util": 0, "worst_util": 0,
+        "best_ventas_mes": "—", "worst_ventas_mes": "—", "best_ventas": 0, "worst_ventas": 0,
+        "meses_positivos": 0, "n_meses": 0, "cobertura": 0,
+        "mom_ventas": None, "mom_sub": "—",
     }
     if n == 0:
         return empty
@@ -445,26 +497,37 @@ def compute_kpis(dff, raw, sel_nums):
     t_costos = dff["Costos"].sum()
     t_egresos = t_gastos + t_costos
     t_utilidad = dff["Utilidad"].sum()
+    t_mo = dff["ManoObra"].sum()
+    t_fin = dff["GastosFin"].sum()
+    t_intereses = dff["Intereses"].sum()
+    t_ebitda = t_utilidad + t_intereses
 
     best_row = dff.loc[dff["Utilidad"].idxmax()]
     worst_row = dff.loc[dff["Utilidad"].idxmin()]
+    best_v_row = dff.loc[dff["Ventas"].idxmax()]
+    worst_v_row = dff.loc[dff["Ventas"].idxmin()]
 
-    cat_gastos = (
-        raw[(raw["Mes_Num"].isin(sel_nums)) & (raw["Tipo"] == "gasto")]
-        .groupby("Categoria")["Monto"]
-        .sum()
-    )
-    if len(cat_gastos) and t_gastos:
-        top_rubro = cat_gastos.idxmax().replace("GASTOS DE ", "").title()
-        top_rubro_pct = cat_gastos.max() / t_gastos * 100
-    else:
-        top_rubro = "—"
-        top_rubro_pct = 0
+    prom_be = dff["Break_Even"].mean() if n else 0
+
+    prom_gastos = dff["Gastos"].mean()
+    prom_ventas = dff["Ventas"].mean()
+    cobertura = prom_ventas / prom_gastos if prom_gastos else 0
 
     mom_ventas = None
+    mom_sub = "—"
     if n >= 2:
-        first, last = dff["Ventas"].iloc[0], dff["Ventas"].iloc[-1]
-        mom_ventas = (last / first - 1) * 100 if first else None
+        last_mom = dff["MoM_Ventas"].iloc[-1]
+        if pd.notna(last_mom):
+            mom_ventas = last_mom
+            mom_sub = f"vs. {dff['Mes'].iloc[-2]} ({fmt(dff['Ventas'].iloc[-2])})"
+    elif n == 1:
+        pos = full_df.index[full_df["Mes"] == dff["Mes"].iloc[0]]
+        if len(pos) and pos[0] > 0:
+            prev = full_df.iloc[pos[0] - 1]
+            cur = dff.iloc[0]
+            if prev["Ventas"]:
+                mom_ventas = (cur["Ventas"] / prev["Ventas"] - 1) * 100
+                mom_sub = f"vs. {prev['Mes']} ({fmt(prev['Ventas'])})"
 
     return {
         "t_ventas": t_ventas,
@@ -472,22 +535,32 @@ def compute_kpis(dff, raw, sel_nums):
         "t_costos": t_costos,
         "t_egresos": t_egresos,
         "t_utilidad": t_utilidad,
-        "margen_bruto": t_utilidad / t_ventas * 100 if t_ventas else 0,
-        "margen_contrib": (t_ventas - t_costos) / t_ventas * 100 if t_ventas else 0,
+        "margen_neto": t_utilidad / t_ventas * 100 if t_ventas else 0,
+        "margen_bruto": (t_ventas - t_costos) / t_ventas * 100 if t_ventas else 0,
         "pct_mp": t_costos / t_ventas * 100 if t_ventas else 0,
+        "pct_mo": t_mo / t_ventas * 100 if t_ventas else 0,
+        "pct_fin": t_fin / t_ventas * 100 if t_ventas else 0,
         "pct_gastos": t_gastos / t_ventas * 100 if t_ventas else 0,
         "pct_egresos": t_egresos / t_ventas * 100 if t_ventas else 0,
-        "prom_ventas": dff["Ventas"].mean(),
+        "ebitda": t_ebitda,
+        "ebitda_pct": t_ebitda / t_ventas * 100 if t_ventas else 0,
+        "roi": t_utilidad / t_egresos * 100 if t_egresos else 0,
+        "prom_ventas": prom_ventas,
         "prom_utilidad": dff["Utilidad"].mean(),
+        "prom_be": prom_be,
         "best_mes": str(best_row["Mes"]),
         "worst_mes": str(worst_row["Mes"]),
         "best_util": best_row["Utilidad"],
         "worst_util": worst_row["Utilidad"],
+        "best_ventas_mes": str(best_v_row["Mes"]),
+        "worst_ventas_mes": str(worst_v_row["Mes"]),
+        "best_ventas": best_v_row["Ventas"],
+        "worst_ventas": worst_v_row["Ventas"],
         "meses_positivos": int((dff["Utilidad"] > 0).sum()),
         "n_meses": n,
-        "top_rubro": top_rubro,
-        "top_rubro_pct": top_rubro_pct,
+        "cobertura": cobertura,
         "mom_ventas": mom_ventas,
+        "mom_sub": mom_sub,
     }
 
 
@@ -556,37 +629,47 @@ st.markdown(f"""
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
 sel_nums = dff["Mes_Num"].tolist() if len(dff) else []
-k = compute_kpis(dff, raw, sel_nums)
-
-mom_sub = f"{k['mom_ventas']:+.1f}% vs. primer mes" if k["mom_ventas"] is not None else "Selecciona 2+ meses"
+k = compute_kpis(dff, raw, sel_nums, df)
 
 render_kpi_section("Resultados del período", [
     ("Ventas Totales", fmt(k["t_ventas"]), f"Promedio {fmt(k['prom_ventas'])}/mes", THEME["ventas"], "↗", "rgba(56,189,248,0.12)"),
-    ("Total Egresos", fmt(k["t_egresos"]), "Gastos operativos + materia prima", THEME["gastos"], "Σ", "rgba(248,113,113,0.12)"),
     ("Utilidad Bruta", fmt(k["t_utilidad"]), "Ventas − egresos totales", THEME["utilidad"], "◉", "rgba(52,211,153,0.12)"),
-    ("Margen Bruto", pct(k["margen_bruto"]), "Utilidad bruta / ventas", THEME["accent"], "%", "rgba(129,140,248,0.12)"),
+    ("Margen Neto", pct(k["margen_neto"]), "Utilidad / ventas", THEME["accent"], "%", "rgba(129,140,248,0.12)"),
+    ("Margen Bruto", pct(k["margen_bruto"]), "Ventas − materia prima", "#2dd4bf", "△", "rgba(45,212,191,0.12)"),
 ])
 
-render_kpi_section("Estructura de costos", [
-    ("Materia Prima", fmt(k["t_costos"]), f"{k['pct_mp']:.1f}% de ventas", THEME["costos"], "◈", "rgba(251,191,36,0.12)"),
-    ("Gastos Operativos", fmt(k["t_gastos"]), f"{k['pct_gastos']:.1f}% de ventas", THEME["gastos"], "◎", "rgba(248,113,113,0.12)"),
-    ("Margen Contribución", pct(k["margen_contrib"]), "Ventas − materia prima", "#2dd4bf", "△", "rgba(45,212,191,0.12)"),
-    ("Egresos / Ventas", pct(k["pct_egresos"]), "Costo total sobre ingresos", "#fb923c", "÷", "rgba(251,146,60,0.12)"),
+render_kpi_section("Eficiencia operativa", [
+    ("Materia Prima", pct(k["pct_mp"]), f"{fmt(k['t_costos'])} en el período", THEME["costos"], "◈", "rgba(251,191,36,0.12)"),
+    ("Mano de Obra", pct(k["pct_mo"]), "% de ventas", THEME["gastos"], "◎", "rgba(248,113,113,0.12)"),
+    ("Gasto Financiero", pct(k["pct_fin"]), "Créditos, intereses y comisiones", "#818cf8", "₿", "rgba(129,140,248,0.12)"),
+    ("EBITDA Aprox.", pct(k["ebitda_pct"]), f"{fmt(k['ebitda'])} · utilidad + intereses", "#a78bfa", "◉", "rgba(167,139,250,0.12)"),
+], small=True)
+
+render_kpi_section("Rentabilidad y liquidez", [
+    ("ROI Período", pct(k["roi"]), "Utilidad / total invertido", THEME["utilidad"], "↗", "rgba(52,211,153,0.12)"),
+    ("Punto de Equilibrio", fmt(k["prom_be"]), "Ventas mínimas mensuales promedio", "#fb923c", "⚖", "rgba(251,146,60,0.12)"),
+    ("Cobertura Gastos", f"{k['cobertura']:.1f}x", "Ventas promedio / gastos operativos", THEME["ventas"], "🛡", "rgba(56,189,248,0.12)"),
+    ("Gastos / Ventas", pct(k["pct_gastos"]), f"{fmt(k['t_gastos'])} operativos", THEME["gastos"], "÷", "rgba(248,113,113,0.12)"),
 ], small=True)
 
 render_kpi_section("Indicadores operativos", [
-    ("Mejor Mes", k["best_mes"], f"Utilidad {fmt(k['best_util'])}", THEME["utilidad"], "▲", "rgba(52,211,153,0.12)"),
-    ("Peor Mes", k["worst_mes"], f"Utilidad {fmt(k['worst_util'])}", THEME["gastos"], "▼", "rgba(248,113,113,0.12)"),
-    ("Meses Rentables", f"{k['meses_positivos']}/{k['n_meses']}", "Meses con utilidad positiva", THEME["ventas"], "✓", "rgba(56,189,248,0.12)"),
-    ("Mayor Rubro de Gasto", k["top_rubro"], f"{k['top_rubro_pct']:.1f}% del total operativo", THEME["accent"], "◆", "rgba(129,140,248,0.12)"),
+    ("Mejor Mes (Utilidad)", k["best_mes"], fmt(k["best_util"]), THEME["utilidad"], "▲", "rgba(52,211,153,0.12)"),
+    ("Peor Mes (Utilidad)", k["worst_mes"], fmt(k["worst_util"]), THEME["gastos"], "▼", "rgba(248,113,113,0.12)"),
+    ("Mejor Mes (Ventas)", k["best_ventas_mes"], fmt(k["best_ventas"]), THEME["ventas"], "★", "rgba(56,189,248,0.12)"),
+    ("Peor Mes (Ventas)", k["worst_ventas_mes"], fmt(k["worst_ventas"]), "#fb923c", "◇", "rgba(251,146,60,0.12)"),
 ], small=True)
 
 if k["mom_ventas"] is not None:
     trend_color = THEME["utilidad"] if k["mom_ventas"] >= 0 else THEME["gastos"]
     render_kpi_section("Tendencia", [
-        ("Variación de Ventas", pct(k["mom_ventas"]), mom_sub, trend_color, "↔", "rgba(129,140,248,0.12)"),
+        ("Crecimiento MoM", f"{k['mom_ventas']:+.1f}%", k["mom_sub"], trend_color, "↔", "rgba(129,140,248,0.12)"),
         ("Utilidad Promedio", fmt(k["prom_utilidad"]), "Por mes en el período", THEME["utilidad"], "≈", "rgba(52,211,153,0.12)"),
-    ], cols=2, small=True)
+        ("Meses Rentables", f"{k['meses_positivos']}/{k['n_meses']}", "Meses con utilidad positiva", THEME["accent"], "✓", "rgba(129,140,248,0.12)"),
+    ], cols=3, small=True)
+else:
+    render_kpi_section("Tendencia", [
+        ("Meses Rentables", f"{k['meses_positivos']}/{k['n_meses']}", "Meses con utilidad positiva", THEME["accent"], "✓", "rgba(129,140,248,0.12)"),
+    ], cols=1, small=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_resumen, tab_analisis, tab_detalle = st.tabs(["Resumen", "Análisis", "Detalle"])
@@ -654,6 +737,34 @@ with tab_resumen:
     st.plotly_chart(fig4, use_container_width=True, config={"displayModeBar": False})
     st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown("""
+    <div class="section-block">
+        <div class="section-header">
+            <p class="section-title">Ratios Clave Mes a Mes</p>
+            <p class="section-desc">Materia prima, mano de obra, gasto financiero y margen neto sobre ventas</p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    fig_ratios = go.Figure()
+    for col, name, color in [
+        ("Pct_MP", "Materia Prima %", THEME["costos"]),
+        ("Pct_MO", "Mano de Obra %", THEME["gastos"]),
+        ("Pct_Fin", "Gasto Financiero %", THEME["accent"]),
+        ("Margen_Neto_Pct", "Margen Neto %", THEME["utilidad"]),
+    ]:
+        fig_ratios.add_trace(go.Scatter(
+            x=dff["Mes"], y=dff[col], name=name,
+            mode="lines+markers",
+            line=dict(color=color, width=2),
+            marker=dict(size=6),
+            hovertemplate=f"<b>{name}</b><br>%{{x}}<br>%{{y:.1f}}%<extra></extra>",
+        ))
+    pct_layout(fig_ratios, height=340)
+    st.markdown('<div class="chart-panel">', unsafe_allow_html=True)
+    st.plotly_chart(fig_ratios, use_container_width=True, config={"displayModeBar": False})
+    st.markdown("</div>", unsafe_allow_html=True)
+
 with tab_analisis:
     c_left, c_right = st.columns(2)
 
@@ -684,21 +795,70 @@ with tab_analisis:
     with c_right:
         st.markdown("""
         <div class="section-header">
-            <p class="section-title">Margen de Utilidad</p>
-            <p class="section-desc">Porcentaje sobre ventas</p>
+            <p class="section-title">Margen Neto</p>
+            <p class="section-desc">Utilidad / ventas por mes</p>
         </div>
         """, unsafe_allow_html=True)
-        bar_colors = [THEME["utilidad"] if v >= 0 else THEME["gastos"] for v in dff["Margen_Pct"]]
+        bar_colors = [THEME["utilidad"] if v >= 0 else THEME["gastos"] for v in dff["Margen_Neto_Pct"]]
         fig3 = go.Figure(go.Bar(
-            x=dff["Mes"], y=dff["Margen_Pct"],
+            x=dff["Mes"], y=dff["Margen_Neto_Pct"],
             marker=dict(color=bar_colors, cornerradius=4),
-            hovertemplate="<b>%{x}</b><br>Margen: %{y:.1f}%<extra></extra>",
+            hovertemplate="<b>%{x}</b><br>Margen neto: %{y:.1f}%<extra></extra>",
         ))
         fig3.add_hline(y=0, line_dash="dot", line_color=THEME["dim"], line_width=1)
-        base_layout(fig3, height=300, legend=False)
-        fig3.update_yaxes(tickprefix="", ticksuffix="%", tickformat=".1f")
+        pct_layout(fig3, height=300, legend=False)
         st.markdown('<div class="chart-panel-sm">', unsafe_allow_html=True)
         st.plotly_chart(fig3, use_container_width=True, config={"displayModeBar": False})
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    c_mom, c_be = st.columns(2)
+
+    with c_mom:
+        st.markdown("""
+        <div class="section-header">
+            <p class="section-title">Crecimiento MoM de Ventas</p>
+            <p class="section-desc">Variación vs. mes anterior</p>
+        </div>
+        """, unsafe_allow_html=True)
+        mom_data = dff[dff["MoM_Ventas"].notna()]
+        mom_colors = [THEME["utilidad"] if v >= 0 else THEME["gastos"] for v in mom_data["MoM_Ventas"]]
+        fig_mom = go.Figure(go.Bar(
+            x=mom_data["Mes"], y=mom_data["MoM_Ventas"],
+            marker=dict(color=mom_colors, cornerradius=4),
+            hovertemplate="<b>%{x}</b><br>MoM: %{y:+.1f}%<extra></extra>",
+        ))
+        fig_mom.add_hline(y=0, line_dash="dot", line_color=THEME["dim"], line_width=1)
+        pct_layout(fig_mom, height=300, legend=False)
+        st.markdown('<div class="chart-panel-sm">', unsafe_allow_html=True)
+        st.plotly_chart(fig_mom, use_container_width=True, config={"displayModeBar": False})
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with c_be:
+        st.markdown("""
+        <div class="section-header">
+            <p class="section-title">Punto de Equilibrio vs Ventas</p>
+            <p class="section-desc">Ventas mínimas para cubrir gastos operativos</p>
+        </div>
+        """, unsafe_allow_html=True)
+        fig_be = go.Figure()
+        fig_be.add_trace(go.Scatter(
+            x=dff["Mes"], y=dff["Ventas"], name="Ventas",
+            mode="lines+markers",
+            line=dict(color=THEME["ventas"], width=2.5),
+            marker=dict(size=7),
+            hovertemplate="Ventas: $%{y:,.0f}<extra></extra>",
+        ))
+        fig_be.add_trace(go.Scatter(
+            x=dff["Mes"], y=dff["Break_Even"], name="Punto de equilibrio",
+            mode="lines+markers",
+            line=dict(color="#fb923c", width=2, dash="dash"),
+            marker=dict(size=7),
+            hovertemplate="Break-even: $%{y:,.0f}<extra></extra>",
+        ))
+        base_layout(fig_be, height=300)
+        fig_be.update_layout(hovermode="x unified")
+        st.markdown('<div class="chart-panel-sm">', unsafe_allow_html=True)
+        st.plotly_chart(fig_be, use_container_width=True, config={"displayModeBar": False})
         st.markdown("</div>", unsafe_allow_html=True)
 
     # Category breakdown
@@ -749,13 +909,21 @@ with tab_detalle:
     </div>
     """, unsafe_allow_html=True)
 
-    display = dff[["Mes", "Ventas", "Gastos", "Costos", "Utilidad", "Margen_Pct"]].copy()
+    display = dff[[
+        "Mes", "Ventas", "Gastos", "Costos", "Utilidad",
+        "MoM_Ventas", "Pct_MP", "Pct_MO", "Pct_Fin", "Break_Even", "ROI_Pct",
+        "Margen_Bruto_Pct", "Margen_Neto_Pct",
+    ]].copy()
     display["Total Egresos"] = display["Gastos"] + display["Costos"]
-    display["Margen Contrib. %"] = ((display["Ventas"] - display["Costos"]) / display["Ventas"] * 100).round(2)
-    display = display[["Mes", "Ventas", "Gastos", "Costos", "Total Egresos", "Utilidad", "Margen Contrib. %", "Margen_Pct"]]
+    display = display[[
+        "Mes", "Ventas", "MoM_Ventas", "Gastos", "Costos", "Total Egresos", "Utilidad",
+        "Pct_MP", "Pct_MO", "Pct_Fin", "Break_Even", "ROI_Pct",
+        "Margen_Bruto_Pct", "Margen_Neto_Pct",
+    ]]
     display.columns = [
-        "Mes", "Ventas", "Gastos Operativos", "Materia Prima",
-        "Total Egresos", "Utilidad Bruta", "Margen Contrib. %", "Margen Bruto %",
+        "Mes", "Ventas", "MoM %", "Gastos Operativos", "Materia Prima", "Total Egresos",
+        "Utilidad Bruta", "MP %", "MO %", "Fin %", "Punto Equilibrio", "ROI %",
+        "Margen Bruto %", "Margen Neto %",
     ]
     st.dataframe(
         display,
@@ -764,12 +932,18 @@ with tab_detalle:
         column_config={
             "Mes": st.column_config.TextColumn("Mes", width="medium"),
             "Ventas": st.column_config.NumberColumn("Ventas", format="$%.2f"),
+            "MoM %": st.column_config.NumberColumn("MoM %", format="%+.1f%%"),
             "Gastos Operativos": st.column_config.NumberColumn("Gastos Operativos", format="$%.2f"),
             "Materia Prima": st.column_config.NumberColumn("Materia Prima", format="$%.2f"),
             "Total Egresos": st.column_config.NumberColumn("Total Egresos", format="$%.2f"),
             "Utilidad Bruta": st.column_config.NumberColumn("Utilidad Bruta", format="$%.2f"),
-            "Margen Contrib. %": st.column_config.NumberColumn("Margen Contrib. %", format="%.2f%%"),
+            "MP %": st.column_config.NumberColumn("MP %", format="%.2f%%"),
+            "MO %": st.column_config.NumberColumn("MO %", format="%.2f%%"),
+            "Fin %": st.column_config.NumberColumn("Fin %", format="%.2f%%"),
+            "Punto Equilibrio": st.column_config.NumberColumn("Punto Equilibrio", format="$%.2f"),
+            "ROI %": st.column_config.NumberColumn("ROI %", format="%.2f%%"),
             "Margen Bruto %": st.column_config.NumberColumn("Margen Bruto %", format="%.2f%%"),
+            "Margen Neto %": st.column_config.NumberColumn("Margen Neto %", format="%.2f%%"),
         },
     )
 
