@@ -7,7 +7,7 @@ import streamlit as st
 DATA_PATH = Path(__file__).parent / "data.csv"
 
 st.set_page_config(
-    page_title="Dashboard Financiero — Pepe Salcedo",
+    page_title="Transformadora de Hules y Plásticos - Dashboard Financiero",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -36,6 +36,32 @@ MES_ORDER = [
 
 CAT_MO = "GASTOS DE MANO DE OBRA"
 CAT_FIN = "GASTOS FINANCIEROS"
+SCENARIO_PRESETS = {
+    "Conservador": {
+        "target_sales": 24_000_000,
+        "shifts_pct": 22,
+        "regional_push_pct": 10,
+        "marketing_pct": 1.8,
+        "t90_energy_pct": 12,
+        "t90_cycle_pct": 7,
+    },
+    "Base": {
+        "target_sales": 30_000_000,
+        "shifts_pct": 35,
+        "regional_push_pct": 18,
+        "marketing_pct": 2.5,
+        "t90_energy_pct": 22,
+        "t90_cycle_pct": 12,
+    },
+    "Agresivo": {
+        "target_sales": 36_000_000,
+        "shifts_pct": 50,
+        "regional_push_pct": 28,
+        "marketing_pct": 3.8,
+        "t90_energy_pct": 30,
+        "t90_cycle_pct": 18,
+    },
+}
 
 st.markdown(f"""
 <style>
@@ -243,6 +269,37 @@ h1, h2, h3 {{
     border: 1px solid {THEME["border"]};
     border-radius: 12px;
     padding: 16px 12px 4px 12px;
+}}
+
+.scenario-shell {{
+    background: linear-gradient(160deg, rgba(24,28,38,0.9), rgba(18,21,28,0.92));
+    border: 1px solid {THEME["border"]};
+    border-radius: 14px;
+    padding: 16px 18px;
+    margin-bottom: 14px;
+}}
+.scenario-shell-title {{
+    margin: 0 0 4px 0;
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    font-size: 1rem;
+    font-weight: 700;
+    color: {THEME["text"]};
+}}
+.scenario-shell-desc {{
+    margin: 0;
+    font-size: 0.82rem;
+    color: {THEME["muted"]};
+}}
+.scenario-chip {{
+    display: inline-block;
+    margin: 8px 8px 0 0;
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-weight: 600;
+    color: {THEME["text"]};
+    background: {THEME["surface_2"]};
+    border: 1px solid {THEME["border"]};
 }}
 
 /* ── Sidebar branding ── */
@@ -564,6 +621,167 @@ def compute_kpis(dff, raw, sel_nums, full_df):
     }
 
 
+def allocate_total(total, base_series, fallback_weights):
+    base_sum = base_series.sum()
+    if base_sum > 0:
+        weights = base_series / base_sum
+    else:
+        weights = fallback_weights
+    return weights.reset_index(drop=True) * total
+
+
+def build_30m_scenario(base_df, raw, target_sales, shifts_pct, regional_push_pct, t90_energy_pct, t90_cycle_pct, marketing_pct):
+    annual = {
+        "ventas": float(base_df["Ventas"].sum()),
+        "costos": float(base_df["Costos"].sum()),
+        "gastos": float(base_df["Gastos"].sum()),
+    }
+    growth_factor = target_sales / annual["ventas"] if annual["ventas"] else 1.0
+
+    base_mo = raw[raw["Categoria"] == CAT_MO]["Monto"].sum()
+    base_fin = raw[raw["Categoria"] == CAT_FIN]["Monto"].sum()
+    base_intereses = raw[(raw["Categoria"] == CAT_FIN) & (raw["Concepto"] == "INTERESES")]["Monto"].sum()
+    base_electricidad = raw[raw["Concepto"] == "ELECTRICIDAD"]["Monto"].sum()
+    base_marketing = raw[raw["Concepto"] == "PUBLICIDAD"]["Monto"].sum()
+    base_logistica = raw[raw["Concepto"].isin(["FLETES", "TRANSPORTE", "CARRETERAS", "COMBUST VEH"])]["Monto"].sum()
+
+    base_otros = annual["gastos"] - (base_mo + base_fin + base_electricidad + base_marketing + base_logistica)
+    base_otros = max(base_otros, 0)
+
+    # Materia prima sube con volumen, pero T90 reduce mermas.
+    mp_fijo = annual["costos"] * 0.15
+    mp_variable = annual["costos"] * 0.85
+    proj_costos = mp_fijo + mp_variable * growth_factor * (1 - (t90_cycle_pct * 0.6))
+
+    # Mano de obra: más turnos + eficiencia de productividad.
+    mo_fijo = base_mo * 0.40
+    mo_variable = base_mo * 0.60
+    proj_mo = (mo_fijo + mo_variable * growth_factor) * (1 + shifts_pct) * (1 - t90_cycle_pct)
+
+    # Electricidad: más carga, mitigada por T90.
+    elec_fijo = base_electricidad * 0.25
+    elec_variable = base_electricidad * 0.75
+    proj_electricidad = elec_fijo + elec_variable * growth_factor * (1 - t90_energy_pct)
+
+    # Logística comercial por expansión geográfica.
+    log_fijo = base_logistica * 0.20
+    log_variable = base_logistica * 0.80
+    proj_logistica = (log_fijo + log_variable * growth_factor) * (1 + regional_push_pct)
+
+    # Otros gastos operativos semi variables.
+    otros_fijo = base_otros * 0.60
+    otros_variable = base_otros * 0.40
+    proj_otros = otros_fijo + otros_variable * growth_factor
+    proj_fin = base_fin * growth_factor
+    proj_intereses = base_intereses * growth_factor
+
+    # Presupuesto comercial mínimo como % de ventas proyectadas.
+    proj_marketing = max(base_marketing * growth_factor, target_sales * marketing_pct)
+
+    proj_gastos = proj_mo + proj_electricidad + proj_logistica + proj_otros + proj_marketing + proj_fin
+    proj_utilidad = target_sales - proj_costos - proj_gastos
+
+    month_weights = (base_df["Ventas"] / base_df["Ventas"].sum()).reset_index(drop=True)
+    out = base_df[["Mes", "Mes_Num", "Ventas", "Costos", "Gastos", "Utilidad"]].copy()
+    out = out.rename(columns={
+        "Ventas": "Ventas_Base",
+        "Costos": "Costos_Base",
+        "Gastos": "Gastos_Base",
+        "Utilidad": "Utilidad_Base",
+    })
+    out["Ventas_30M"] = allocate_total(target_sales, base_df["Ventas"], month_weights)
+    out["Costos_30M"] = allocate_total(proj_costos, base_df["Costos"], month_weights)
+    out["MO_30M"] = allocate_total(
+        proj_mo,
+        raw[raw["Categoria"] == CAT_MO].groupby("Mes_Num")["Monto"].sum().reindex(out["Mes_Num"]).fillna(0).reset_index(drop=True),
+        month_weights,
+    )
+    out["Electricidad_30M"] = allocate_total(
+        proj_electricidad,
+        raw[raw["Concepto"] == "ELECTRICIDAD"].groupby("Mes_Num")["Monto"].sum().reindex(out["Mes_Num"]).fillna(0).reset_index(drop=True),
+        month_weights,
+    )
+    out["Logistica_30M"] = allocate_total(
+        proj_logistica,
+        raw[raw["Concepto"].isin(["FLETES", "TRANSPORTE", "CARRETERAS", "COMBUST VEH"])].groupby("Mes_Num")["Monto"].sum().reindex(out["Mes_Num"]).fillna(0).reset_index(drop=True),
+        month_weights,
+    )
+    out["Marketing_30M"] = allocate_total(
+        proj_marketing,
+        raw[raw["Concepto"] == "PUBLICIDAD"].groupby("Mes_Num")["Monto"].sum().reindex(out["Mes_Num"]).fillna(0).reset_index(drop=True),
+        month_weights,
+    )
+    out["Fin_30M"] = allocate_total(
+        proj_fin,
+        raw[raw["Categoria"] == CAT_FIN].groupby("Mes_Num")["Monto"].sum().reindex(out["Mes_Num"]).fillna(0).reset_index(drop=True),
+        month_weights,
+    )
+    out["Intereses_30M"] = allocate_total(
+        proj_intereses,
+        raw[(raw["Categoria"] == CAT_FIN) & (raw["Concepto"] == "INTERESES")].groupby("Mes_Num")["Monto"].sum().reindex(out["Mes_Num"]).fillna(0).reset_index(drop=True),
+        month_weights,
+    )
+    out["Otros_30M"] = allocate_total(
+        proj_otros,
+        (
+            raw[
+                ~raw["Categoria"].isin([CAT_MO, CAT_FIN])
+                & ~raw["Concepto"].isin(["ELECTRICIDAD", "PUBLICIDAD", "FLETES", "TRANSPORTE", "CARRETERAS", "COMBUST VEH"])
+                & (raw["Tipo"] == "gasto")
+            ]
+            .groupby("Mes_Num")["Monto"]
+            .sum()
+            .reindex(out["Mes_Num"])
+            .fillna(0)
+            .reset_index(drop=True)
+        ),
+        month_weights,
+    )
+    out["Gastos_30M"] = out["MO_30M"] + out["Electricidad_30M"] + out["Logistica_30M"] + out["Marketing_30M"] + out["Fin_30M"] + out["Otros_30M"]
+    out["Utilidad_30M"] = out["Ventas_30M"] - out["Costos_30M"] - out["Gastos_30M"]
+    out["Margen_30M_Pct"] = (out["Utilidad_30M"] / out["Ventas_30M"] * 100).round(2)
+
+    annual_out = {
+        "ventas_base": annual["ventas"],
+        "ventas_30m": target_sales,
+        "costos_base": annual["costos"],
+        "costos_30m": proj_costos,
+        "gastos_base": annual["gastos"],
+        "gastos_30m": proj_gastos,
+        "fin_30m": proj_fin,
+        "mo_30m": proj_mo,
+        "marketing_30m": proj_marketing,
+        "logistica_30m": proj_logistica,
+        "utilidad_base": annual["ventas"] - annual["costos"] - annual["gastos"],
+        "utilidad_30m": proj_utilidad,
+        "margen_base": ((annual["ventas"] - annual["costos"] - annual["gastos"]) / annual["ventas"] * 100) if annual["ventas"] else 0,
+        "margen_30m": (proj_utilidad / target_sales * 100) if target_sales else 0,
+        "growth_pct": (target_sales / annual["ventas"] - 1) * 100 if annual["ventas"] else 0,
+    }
+    return out.sort_values("Mes_Num").reset_index(drop=True), annual_out
+
+
+def build_scenario_dashboard_frame(scenario_df):
+    scen = scenario_df[["Mes", "Mes_Num"]].copy()
+    scen["Ventas"] = scenario_df["Ventas_30M"]
+    scen["Costos"] = scenario_df["Costos_30M"]
+    scen["Gastos"] = scenario_df["Gastos_30M"]
+    scen["Utilidad"] = scenario_df["Utilidad_30M"]
+    scen["Margen_Neto_Pct"] = (scen["Utilidad"] / scen["Ventas"] * 100).round(2)
+    scen["Margen_Bruto_Pct"] = ((scen["Ventas"] - scen["Costos"]) / scen["Ventas"] * 100).round(2)
+    scen["ManoObra"] = scenario_df["MO_30M"]
+    scen["GastosFin"] = scenario_df["Fin_30M"]
+    scen["Intereses"] = scenario_df["Intereses_30M"]
+    scen["Pct_MP"] = (scen["Costos"] / scen["Ventas"] * 100).round(2)
+    scen["Pct_MO"] = (scen["ManoObra"] / scen["Ventas"] * 100).round(2)
+    scen["Pct_Fin"] = (scen["GastosFin"] / scen["Ventas"] * 100).round(2)
+    mc = (scen["Ventas"] - scen["Costos"]) / scen["Ventas"]
+    scen["Break_Even"] = (scen["Gastos"] / mc).where(mc > 0)
+    scen["ROI_Pct"] = (scen["Utilidad"] / (scen["Costos"] + scen["Gastos"]) * 100).round(2)
+    scen["MoM_Ventas"] = (scen["Ventas"].pct_change() * 100).round(1)
+    return scen
+
+
 raw = load_raw()
 df = load_summary()
 
@@ -620,61 +838,135 @@ st.markdown(f"""
 <div class="page-header">
     <div class="page-header-left">
         <div class="page-eyebrow">Reporte Ejecutivo · 2025</div>
-        <h1 class="page-title">Dashboard Financiero</h1>
+        <h1 class="page-title">Transformadora de Hules y Plásticos - Dashboard Financiero</h1>
         <p class="page-subtitle">Análisis de ventas, costos operativos y utilidad bruta</p>
     </div>
     <div class="page-badge">Período: <strong>{period_label}</strong></div>
 </div>
 """, unsafe_allow_html=True)
 
-# ── KPIs ──────────────────────────────────────────────────────────────────────
-sel_nums = dff["Mes_Num"].tolist() if len(dff) else []
-k = compute_kpis(dff, raw, sel_nums, df)
-
-render_kpi_section("Resultados del período", [
-    ("Ventas Totales", fmt(k["t_ventas"]), f"Promedio {fmt(k['prom_ventas'])}/mes", THEME["ventas"], "↗", "rgba(56,189,248,0.12)"),
-    ("Utilidad Bruta", fmt(k["t_utilidad"]), "Ventas − egresos totales", THEME["utilidad"], "◉", "rgba(52,211,153,0.12)"),
-    ("Margen Neto", pct(k["margen_neto"]), "Utilidad / ventas", THEME["accent"], "%", "rgba(129,140,248,0.12)"),
-    ("Margen Bruto", pct(k["margen_bruto"]), "Ventas − materia prima", "#2dd4bf", "△", "rgba(45,212,191,0.12)"),
-])
-
-render_kpi_section("Eficiencia operativa", [
-    ("Materia Prima", pct(k["pct_mp"]), f"{fmt(k['t_costos'])} en el período", THEME["costos"], "◈", "rgba(251,191,36,0.12)"),
-    ("Mano de Obra", pct(k["pct_mo"]), "% de ventas", THEME["gastos"], "◎", "rgba(248,113,113,0.12)"),
-    ("Gasto Financiero", pct(k["pct_fin"]), "Créditos, intereses y comisiones", "#818cf8", "₿", "rgba(129,140,248,0.12)"),
-    ("EBITDA Aprox.", pct(k["ebitda_pct"]), f"{fmt(k['ebitda'])} · utilidad + intereses", "#a78bfa", "◉", "rgba(167,139,250,0.12)"),
-], small=True)
-
-render_kpi_section("Rentabilidad y liquidez", [
-    ("ROI Período", pct(k["roi"]), "Utilidad / total invertido", THEME["utilidad"], "↗", "rgba(52,211,153,0.12)"),
-    ("Punto de Equilibrio", fmt(k["prom_be"]), "Ventas mínimas mensuales promedio", "#fb923c", "⚖", "rgba(251,146,60,0.12)"),
-    ("Cobertura Gastos", f"{k['cobertura']:.1f}x", "Ventas promedio / gastos operativos", THEME["ventas"], "🛡", "rgba(56,189,248,0.12)"),
-    ("Gastos / Ventas", pct(k["pct_gastos"]), f"{fmt(k['t_gastos'])} operativos", THEME["gastos"], "÷", "rgba(248,113,113,0.12)"),
-], small=True)
-
-render_kpi_section("Indicadores operativos", [
-    ("Mejor Mes (Utilidad)", k["best_mes"], fmt(k["best_util"]), THEME["utilidad"], "▲", "rgba(52,211,153,0.12)"),
-    ("Peor Mes (Utilidad)", k["worst_mes"], fmt(k["worst_util"]), THEME["gastos"], "▼", "rgba(248,113,113,0.12)"),
-    ("Mejor Mes (Ventas)", k["best_ventas_mes"], fmt(k["best_ventas"]), THEME["ventas"], "★", "rgba(56,189,248,0.12)"),
-    ("Peor Mes (Ventas)", k["worst_ventas_mes"], fmt(k["worst_ventas"]), "#fb923c", "◇", "rgba(251,146,60,0.12)"),
-], small=True)
-
-if k["mom_ventas"] is not None:
-    trend_color = THEME["utilidad"] if k["mom_ventas"] >= 0 else THEME["gastos"]
-    render_kpi_section("Tendencia", [
-        ("Crecimiento MoM", f"{k['mom_ventas']:+.1f}%", k["mom_sub"], trend_color, "↔", "rgba(129,140,248,0.12)"),
-        ("Utilidad Promedio", fmt(k["prom_utilidad"]), "Por mes en el período", THEME["utilidad"], "≈", "rgba(52,211,153,0.12)"),
-        ("Meses Rentables", f"{k['meses_positivos']}/{k['n_meses']}", "Meses con utilidad positiva", THEME["accent"], "✓", "rgba(129,140,248,0.12)"),
-    ], cols=3, small=True)
-else:
-    render_kpi_section("Tendencia", [
-        ("Meses Rentables", f"{k['meses_positivos']}/{k['n_meses']}", "Meses con utilidad positiva", THEME["accent"], "✓", "rgba(129,140,248,0.12)"),
-    ], cols=1, small=True)
-
 # ── Tabs ──────────────────────────────────────────────────────────────────────
+base_dff = dff.copy()
+selected_scenario = st.radio(
+    "Escenario activo",
+    options=["Actual", "Conservador", "Agresivo", "Personalizado"],
+    horizontal=True,
+    key="selected_scenario_global",
+)
+
+scenario_monthly = None
+scenario_slug = selected_scenario.lower().replace(" ", "_")
+if selected_scenario == "Actual":
+    dff = base_dff
+    st.markdown("""
+    <div class="scenario-shell">
+        <p class="scenario-shell-title">Escenario activo: Actual</p>
+        <p class="scenario-shell-desc">Vista operativa basada en los datos reales del período seleccionado.</p>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    scenario_presets = {
+        "Conservador": SCENARIO_PRESETS["Conservador"],
+        "Agresivo": SCENARIO_PRESETS["Agresivo"],
+    }
+    if selected_scenario == "Personalizado":
+        custom_col_1, custom_col_2, custom_col_3 = st.columns(3)
+        with custom_col_1:
+            custom_target = st.number_input(
+                "Meta de ventas anual (MXN)",
+                min_value=1_000_000,
+                max_value=80_000_000,
+                step=500_000,
+                format="%d",
+                value=30_000_000,
+                key="custom_target_sales_input_global",
+            )
+            custom_shifts = st.slider("Impacto turnos extra MO (%)", min_value=0, max_value=80, step=1, value=35, key="custom_shifts_input_global")
+        with custom_col_2:
+            custom_regional = st.slider("Sobrecosto logístico (%)", min_value=0, max_value=60, step=1, value=18, key="custom_regional_input_global")
+            custom_marketing = st.slider("Marketing como % de ventas", min_value=0.0, max_value=10.0, step=0.1, value=2.5, key="custom_marketing_input_global")
+        with custom_col_3:
+            custom_energy = st.slider("Ahorro energía T90 (%)", min_value=0, max_value=40, step=1, value=22, key="custom_energy_input_global")
+            custom_cycle = st.slider("Eficiencia ciclo T90 (%)", min_value=0, max_value=35, step=1, value=12, key="custom_cycle_input_global")
+        cfg = {
+            "target_sales": custom_target,
+            "shifts_pct": custom_shifts / 100,
+            "regional_push_pct": custom_regional / 100,
+            "marketing_pct": custom_marketing / 100,
+            "t90_energy_pct": custom_energy / 100,
+            "t90_cycle_pct": custom_cycle / 100,
+        }
+    else:
+        preset = scenario_presets[selected_scenario]
+        cfg = {
+            "target_sales": preset["target_sales"],
+            "shifts_pct": preset["shifts_pct"] / 100,
+            "regional_push_pct": preset["regional_push_pct"] / 100,
+            "marketing_pct": preset["marketing_pct"] / 100,
+            "t90_energy_pct": preset["t90_energy_pct"] / 100,
+            "t90_cycle_pct": preset["t90_cycle_pct"] / 100,
+        }
+
+    scenario_monthly, scenario_kpi = build_30m_scenario(df, raw, **cfg)
+    scenario_view = build_scenario_dashboard_frame(scenario_monthly)
+    dff = scenario_view[scenario_view["Mes"].isin(sel)].copy() if sel else scenario_view
+    st.markdown(f"""
+    <div class="scenario-shell">
+        <p class="scenario-shell-title">Escenario activo: {selected_scenario}</p>
+        <p class="scenario-shell-desc">Todos los tabs se actualizan con este escenario.</p>
+        <span class="scenario-chip">Meta ventas: {fmt(cfg["target_sales"])}</span>
+        <span class="scenario-chip">Crecimiento: {scenario_kpi["growth_pct"]:.1f}%</span>
+        <span class="scenario-chip">Margen: {scenario_kpi["margen_30m"]:.1f}%</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+kpi_reference_df = df if selected_scenario == "Actual" else scenario_view
+sel_nums = dff["Mes_Num"].tolist() if len(dff) else []
 tab_resumen, tab_analisis, tab_detalle = st.tabs(["Resumen", "Análisis", "Detalle"])
 
 with tab_resumen:
+    k = compute_kpis(dff, raw, sel_nums, kpi_reference_df)
+
+    render_kpi_section("Resultados del período", [
+        ("Ventas Totales", fmt(k["t_ventas"]), f"Promedio {fmt(k['prom_ventas'])}/mes", THEME["ventas"], "↗", "rgba(56,189,248,0.12)"),
+        ("Utilidad Bruta", fmt(k["t_utilidad"]), "Ventas − egresos totales", THEME["utilidad"], "◉", "rgba(52,211,153,0.12)"),
+        ("Margen Neto", pct(k["margen_neto"]), "Utilidad / ventas", THEME["accent"], "%", "rgba(129,140,248,0.12)"),
+        ("Margen Bruto", pct(k["margen_bruto"]), "Ventas − materia prima", "#2dd4bf", "△", "rgba(45,212,191,0.12)"),
+    ])
+
+    render_kpi_section("Eficiencia operativa", [
+        ("Materia Prima", pct(k["pct_mp"]), f"{fmt(k['t_costos'])} en el período", THEME["costos"], "◈", "rgba(251,191,36,0.12)"),
+        ("Mano de Obra", pct(k["pct_mo"]), "% de ventas", THEME["gastos"], "◎", "rgba(248,113,113,0.12)"),
+        ("Gasto Financiero", pct(k["pct_fin"]), "Créditos, intereses y comisiones", "#818cf8", "₿", "rgba(129,140,248,0.12)"),
+        ("EBITDA Aprox.", pct(k["ebitda_pct"]), f"{fmt(k['ebitda'])} · utilidad + intereses", "#a78bfa", "◉", "rgba(167,139,250,0.12)"),
+    ], small=True)
+
+    render_kpi_section("Rentabilidad y liquidez", [
+        ("ROI Período", pct(k["roi"]), "Utilidad / total invertido", THEME["utilidad"], "↗", "rgba(52,211,153,0.12)"),
+        ("Punto de Equilibrio", fmt(k["prom_be"]), "Ventas mínimas mensuales promedio", "#fb923c", "⚖", "rgba(251,146,60,0.12)"),
+        ("Cobertura Gastos", f"{k['cobertura']:.1f}x", "Ventas promedio / gastos operativos", THEME["ventas"], "🛡", "rgba(56,189,248,0.12)"),
+        ("Gastos / Ventas", pct(k["pct_gastos"]), f"{fmt(k['t_gastos'])} operativos", THEME["gastos"], "÷", "rgba(248,113,113,0.12)"),
+    ], small=True)
+
+    render_kpi_section("Indicadores operativos", [
+        ("Mejor Mes (Utilidad)", k["best_mes"], fmt(k["best_util"]), THEME["utilidad"], "▲", "rgba(52,211,153,0.12)"),
+        ("Peor Mes (Utilidad)", k["worst_mes"], fmt(k["worst_util"]), THEME["gastos"], "▼", "rgba(248,113,113,0.12)"),
+        ("Mejor Mes (Ventas)", k["best_ventas_mes"], fmt(k["best_ventas"]), THEME["ventas"], "★", "rgba(56,189,248,0.12)"),
+        ("Peor Mes (Ventas)", k["worst_ventas_mes"], fmt(k["worst_ventas"]), "#fb923c", "◇", "rgba(251,146,60,0.12)"),
+    ], small=True)
+
+    if k["mom_ventas"] is not None:
+        trend_color = THEME["utilidad"] if k["mom_ventas"] >= 0 else THEME["gastos"]
+        render_kpi_section("Tendencia", [
+            ("Crecimiento MoM", f"{k['mom_ventas']:+.1f}%", k["mom_sub"], trend_color, "↔", "rgba(129,140,248,0.12)"),
+            ("Utilidad Promedio", fmt(k["prom_utilidad"]), "Por mes en el período", THEME["utilidad"], "≈", "rgba(52,211,153,0.12)"),
+            ("Meses Rentables", f"{k['meses_positivos']}/{k['n_meses']}", "Meses con utilidad positiva", THEME["accent"], "✓", "rgba(129,140,248,0.12)"),
+        ], cols=3, small=True)
+    else:
+        render_kpi_section("Tendencia", [
+            ("Meses Rentables", f"{k['meses_positivos']}/{k['n_meses']}", "Meses con utilidad positiva", THEME["accent"], "✓", "rgba(129,140,248,0.12)"),
+        ], cols=1, small=True)
+
     st.markdown("""
     <div class="section-block">
         <div class="section-header">
@@ -871,13 +1163,37 @@ with tab_analisis:
     </div>
     """, unsafe_allow_html=True)
 
-    cat_gastos = (
-        raw[(raw["Mes_Num"].isin(sel_nums)) & (raw["Tipo"] == "gasto")]
-        .groupby("Categoria")["Monto"]
-        .sum()
-        .reset_index()
-        .sort_values("Monto", ascending=False)
-    )
+    if selected_scenario == "Actual":
+        cat_gastos = (
+            raw[(raw["Mes_Num"].isin(sel_nums)) & (raw["Tipo"] == "gasto")]
+            .groupby("Categoria")["Monto"]
+            .sum()
+            .reset_index()
+            .sort_values("Monto", ascending=False)
+        )
+    else:
+        scenario_scope = scenario_monthly[scenario_monthly["Mes"].isin(sel)].copy() if sel else scenario_monthly.copy()
+        cat_gastos = pd.DataFrame(
+            {
+                "Categoria": [
+                    "Mano de Obra",
+                    "Gastos Financieros",
+                    "Electricidad",
+                    "Logística",
+                    "Marketing",
+                    "Otros",
+                ],
+                "Monto": [
+                    scenario_scope["MO_30M"].sum(),
+                    scenario_scope["Fin_30M"].sum(),
+                    scenario_scope["Electricidad_30M"].sum(),
+                    scenario_scope["Logistica_30M"].sum(),
+                    scenario_scope["Marketing_30M"].sum(),
+                    scenario_scope["Otros_30M"].sum(),
+                ],
+            }
+        ).sort_values("Monto", ascending=False)
+        cat_gastos = cat_gastos[cat_gastos["Monto"] > 0]
 
     palette = ["#38bdf8", "#f87171", "#fbbf24", "#34d399", "#818cf8", "#fb923c"]
     fig5 = go.Figure(go.Pie(
@@ -947,36 +1263,81 @@ with tab_detalle:
         },
     )
 
-    st.markdown("""
-    <div class="section-block">
-        <div class="section-header">
-            <p class="section-title">Desglose por Cuenta Contable</p>
-            <p class="section-desc">Detalle acumulado del período seleccionado</p>
+    if selected_scenario == "Actual":
+        st.markdown("""
+        <div class="section-block">
+            <div class="section-header">
+                <p class="section-title">Desglose por Cuenta Contable</p>
+                <p class="section-desc">Detalle acumulado del período seleccionado</p>
+            </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    detalle = raw[raw["Mes_Num"].isin(sel_nums)].copy()
-    cat = (
-        detalle.groupby(["Tipo", "Categoria", "Subcategoria", "Codigo", "Concepto"], dropna=False)["Monto"]
-        .sum()
-        .reset_index()
-        .sort_values(["Tipo", "Categoria", "Subcategoria", "Codigo"])
-    )
-    cat = cat.rename(columns={
-        "Tipo": "Tipo",
-        "Categoria": "Categoría",
-        "Subcategoria": "Subcategoría",
-        "Codigo": "Código",
-        "Concepto": "Concepto",
-        "Monto": "Total",
-    })
-    st.dataframe(
-        cat,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Total": st.column_config.NumberColumn("Total", format="$%.2f"),
-            "Subcategoría": st.column_config.TextColumn("Subcategoría"),
-        },
-    )
+        detalle = raw[raw["Mes_Num"].isin(sel_nums)].copy()
+        cat = (
+            detalle.groupby(["Tipo", "Categoria", "Subcategoria", "Codigo", "Concepto"], dropna=False)["Monto"]
+            .sum()
+            .reset_index()
+            .sort_values(["Tipo", "Categoria", "Subcategoria", "Codigo"])
+        )
+        cat = cat.rename(columns={
+            "Tipo": "Tipo",
+            "Categoria": "Categoría",
+            "Subcategoria": "Subcategoría",
+            "Codigo": "Código",
+            "Concepto": "Concepto",
+            "Monto": "Total",
+        })
+        st.dataframe(
+            cat,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Total": st.column_config.NumberColumn("Total", format="$%.2f"),
+                "Subcategoría": st.column_config.TextColumn("Subcategoría"),
+            },
+        )
+    else:
+        st.markdown("""
+        <div class="section-block">
+            <div class="section-header">
+                <p class="section-title">Desglose del Escenario</p>
+                <p class="section-desc">Composición mensual de costos y gastos proyectados</p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        scenario_scope = scenario_monthly[scenario_monthly["Mes"].isin(sel)].copy() if sel else scenario_monthly.copy()
+        scen_detail = scenario_scope[[
+            "Mes", "Ventas_30M", "Costos_30M", "MO_30M", "Electricidad_30M", "Logistica_30M",
+            "Marketing_30M", "Fin_30M", "Otros_30M", "Gastos_30M", "Utilidad_30M", "Margen_30M_Pct",
+        ]].rename(columns={
+            "Ventas_30M": "Ventas Escenario",
+            "Costos_30M": "Materia Prima",
+            "MO_30M": "Mano de Obra",
+            "Electricidad_30M": "Electricidad",
+            "Logistica_30M": "Logística",
+            "Marketing_30M": "Marketing",
+            "Fin_30M": "Gasto Financiero",
+            "Otros_30M": "Otros Gastos",
+            "Gastos_30M": "Gastos Totales",
+            "Utilidad_30M": "Utilidad Escenario",
+            "Margen_30M_Pct": "Margen Escenario %",
+        })
+        st.dataframe(
+            scen_detail,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ventas Escenario": st.column_config.NumberColumn("Ventas Escenario", format="$%.2f"),
+                "Materia Prima": st.column_config.NumberColumn("Materia Prima", format="$%.2f"),
+                "Mano de Obra": st.column_config.NumberColumn("Mano de Obra", format="$%.2f"),
+                "Electricidad": st.column_config.NumberColumn("Electricidad", format="$%.2f"),
+                "Logística": st.column_config.NumberColumn("Logística", format="$%.2f"),
+                "Marketing": st.column_config.NumberColumn("Marketing", format="$%.2f"),
+                "Gasto Financiero": st.column_config.NumberColumn("Gasto Financiero", format="$%.2f"),
+                "Otros Gastos": st.column_config.NumberColumn("Otros Gastos", format="$%.2f"),
+                "Gastos Totales": st.column_config.NumberColumn("Gastos Totales", format="$%.2f"),
+                "Utilidad Escenario": st.column_config.NumberColumn("Utilidad Escenario", format="$%.2f"),
+                "Margen Escenario %": st.column_config.NumberColumn("Margen Escenario %", format="%.2f%%"),
+            },
+        )
