@@ -1,6 +1,11 @@
-import streamlit as st
+from pathlib import Path
+
 import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
+
+DATA_PATH = Path(__file__).parent / "data.csv"
+
 st.set_page_config(
     page_title="Dashboard Financiero — Pepe Salcedo",
     page_icon="📊",
@@ -299,7 +304,7 @@ div[data-testid="stMetric"] {{
 
 @st.cache_data
 def load_raw():
-    return pd.read_csv("data.csv")
+    return pd.read_csv(DATA_PATH)
 
 
 @st.cache_data
