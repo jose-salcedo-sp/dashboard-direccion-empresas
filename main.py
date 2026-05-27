@@ -463,6 +463,14 @@ def pct(v):
     return f"{v:.1f}%"
 
 
+def delta_money(v):
+    return f"{v:+,.0f} MXN"
+
+
+def delta_pct(v):
+    return f"{v:+.1f} pp"
+
+
 def base_layout(fig, height=360, legend=True):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
@@ -912,8 +920,8 @@ else:
     dff = scenario_view[scenario_view["Mes"].isin(sel)].copy() if sel else scenario_view
     st.markdown(f"""
     <div class="scenario-shell">
-        <p class="scenario-shell-title">Escenario activo: {selected_scenario}</p>
-        <p class="scenario-shell-desc">Todos los tabs se actualizan con este escenario.</p>
+        <p class="scenario-shell-title">Escenario vs Actual: {selected_scenario}</p>
+        <p class="scenario-shell-desc">Todos los tabs muestran el desempeño proyectado contra el caso real.</p>
         <span class="scenario-chip">Meta ventas: {fmt(cfg["target_sales"])}</span>
         <span class="scenario-chip">Crecimiento: {scenario_kpi["growth_pct"]:.1f}%</span>
         <span class="scenario-chip">Margen: {scenario_kpi["margen_30m"]:.1f}%</span>
@@ -922,17 +930,29 @@ else:
 
 kpi_reference_df = df if selected_scenario == "Actual" else scenario_view
 sel_nums = dff["Mes_Num"].tolist() if len(dff) else []
+actual_compare_dff = base_dff[base_dff["Mes"].isin(sel)].copy() if sel else base_dff.copy()
+actual_compare_sel_nums = actual_compare_dff["Mes_Num"].tolist() if len(actual_compare_dff) else []
+actual_k = compute_kpis(actual_compare_dff, raw, actual_compare_sel_nums, df)
 tab_resumen, tab_analisis, tab_detalle = st.tabs(["Resumen", "Análisis", "Detalle"])
 
 with tab_resumen:
     k = compute_kpis(dff, raw, sel_nums, kpi_reference_df)
 
-    render_kpi_section("Resultados del período", [
-        ("Ventas Totales", fmt(k["t_ventas"]), f"Promedio {fmt(k['prom_ventas'])}/mes", THEME["ventas"], "↗", "rgba(56,189,248,0.12)"),
-        ("Utilidad Bruta", fmt(k["t_utilidad"]), "Ventas − egresos totales", THEME["utilidad"], "◉", "rgba(52,211,153,0.12)"),
-        ("Margen Neto", pct(k["margen_neto"]), "Utilidad / ventas", THEME["accent"], "%", "rgba(129,140,248,0.12)"),
-        ("Margen Bruto", pct(k["margen_bruto"]), "Ventas − materia prima", "#2dd4bf", "△", "rgba(45,212,191,0.12)"),
-    ])
+    if selected_scenario == "Actual":
+        period_cards = [
+            ("Ventas Totales", fmt(k["t_ventas"]), f"Promedio {fmt(k['prom_ventas'])}/mes", THEME["ventas"], "↗", "rgba(56,189,248,0.12)"),
+            ("Utilidad Bruta", fmt(k["t_utilidad"]), "Ventas − egresos totales", THEME["utilidad"], "◉", "rgba(52,211,153,0.12)"),
+            ("Margen Neto", pct(k["margen_neto"]), "Utilidad / ventas", THEME["accent"], "%", "rgba(129,140,248,0.12)"),
+            ("Margen Bruto", pct(k["margen_bruto"]), "Ventas − materia prima", "#2dd4bf", "△", "rgba(45,212,191,0.12)"),
+        ]
+    else:
+        period_cards = [
+            ("Ventas Escenario", fmt(k["t_ventas"]), f"vs actual {delta_money(k['t_ventas'] - actual_k['t_ventas'])}", THEME["ventas"], "↗", "rgba(56,189,248,0.12)"),
+            ("Utilidad Escenario", fmt(k["t_utilidad"]), f"vs actual {delta_money(k['t_utilidad'] - actual_k['t_utilidad'])}", THEME["utilidad"], "◉", "rgba(52,211,153,0.12)"),
+            ("Margen Neto Esc.", pct(k["margen_neto"]), f"vs actual {delta_pct(k['margen_neto'] - actual_k['margen_neto'])}", THEME["accent"], "%", "rgba(129,140,248,0.12)"),
+            ("Margen Bruto Esc.", pct(k["margen_bruto"]), f"vs actual {delta_pct(k['margen_bruto'] - actual_k['margen_bruto'])}", "#2dd4bf", "△", "rgba(45,212,191,0.12)"),
+        ]
+    render_kpi_section("Resultados del período", period_cards)
 
     render_kpi_section("Eficiencia operativa", [
         ("Materia Prima", pct(k["pct_mp"]), f"{fmt(k['t_costos'])} en el período", THEME["costos"], "◈", "rgba(251,191,36,0.12)"),
@@ -977,16 +997,45 @@ with tab_resumen:
     """, unsafe_allow_html=True)
 
     fig1 = go.Figure()
-    for col, name, color in [
-        ("Ventas", "Ventas", THEME["ventas"]),
-        ("Gastos", "Gastos Operativos", THEME["gastos"]),
-        ("Costos", "Materia Prima", THEME["costos"]),
-    ]:
+    if selected_scenario == "Actual":
+        for col, name, color in [
+            ("Ventas", "Ventas", THEME["ventas"]),
+            ("Gastos", "Gastos Operativos", THEME["gastos"]),
+            ("Costos", "Materia Prima", THEME["costos"]),
+        ]:
+            fig1.add_trace(go.Bar(
+                x=dff["Mes"], y=dff[col], name=name,
+                marker=dict(color=color, line=dict(width=0), cornerradius=4),
+                hovertemplate=f"<b>{name}</b><br>%{{x}}<br>$%{{y:,.0f}}<extra></extra>",
+            ))
+    else:
         fig1.add_trace(go.Bar(
-            x=dff["Mes"], y=dff[col], name=name,
-            marker=dict(color=color, line=dict(width=0), cornerradius=4),
-            hovertemplate=f"<b>{name}</b><br>%{{x}}<br>$%{{y:,.0f}}<extra></extra>",
+            x=actual_compare_dff["Mes"], y=actual_compare_dff["Ventas"], name="Ventas Actual",
+            marker=dict(color="rgba(56,189,248,0.28)", line=dict(width=0), cornerradius=4),
+            hovertemplate="<b>Ventas Actual</b><br>%{x}<br>$%{y:,.0f}<extra></extra>",
         ))
+        fig1.add_trace(go.Bar(
+            x=dff["Mes"], y=dff["Ventas"], name="Ventas Escenario",
+            marker=dict(color=THEME["ventas"], line=dict(width=0), cornerradius=4),
+            hovertemplate="<b>Ventas Escenario</b><br>%{x}<br>$%{y:,.0f}<extra></extra>",
+        ))
+        fig1.add_trace(go.Scatter(
+            x=dff["Mes"], y=dff["Utilidad"], name="Utilidad Escenario",
+            mode="lines+markers",
+            yaxis="y2",
+            line=dict(color=THEME["utilidad"], width=2),
+            hovertemplate="<b>Utilidad Escenario</b><br>%{x}<br>$%{y:,.0f}<extra></extra>",
+        ))
+        fig1.update_layout(
+            yaxis2=dict(
+                overlaying="y",
+                side="right",
+                showgrid=False,
+                tickprefix="$",
+                tickformat=",.0f",
+                color=THEME["muted"],
+            )
+        )
     fig1.update_layout(barmode="group", bargap=0.22, bargroupgap=0.08)
     base_layout(fig1, height=380)
     st.markdown('<div class="chart-panel">', unsafe_allow_html=True)
@@ -1068,6 +1117,15 @@ with tab_analisis:
         </div>
         """, unsafe_allow_html=True)
         fig2 = go.Figure()
+        if selected_scenario != "Actual":
+            fig2.add_trace(go.Scatter(
+                x=actual_compare_dff["Mes"], y=actual_compare_dff["Utilidad"],
+                mode="lines+markers",
+                line=dict(color="rgba(148,163,184,0.8)", width=2, dash="dot"),
+                marker=dict(size=6),
+                name="Utilidad Actual",
+                hovertemplate="<b>%{x}</b><br>Utilidad Actual: $%{y:,.0f}<extra></extra>",
+            ))
         colors = [THEME["utilidad"] if v >= 0 else THEME["gastos"] for v in dff["Utilidad"]]
         fig2.add_trace(go.Scatter(
             x=dff["Mes"], y=dff["Utilidad"],
@@ -1076,6 +1134,7 @@ with tab_analisis:
             marker=dict(size=7, color=colors, line=dict(width=2, color=THEME["surface"])),
             fill="tozeroy",
             fillcolor="rgba(52,211,153,0.08)",
+            name="Utilidad Escenario" if selected_scenario != "Actual" else "Utilidad",
             hovertemplate="<b>%{x}</b><br>Utilidad: $%{y:,.0f}<extra></extra>",
         ))
         fig2.add_hline(y=0, line_dash="dot", line_color=THEME["dim"], line_width=1)
@@ -1092,9 +1151,18 @@ with tab_analisis:
         </div>
         """, unsafe_allow_html=True)
         bar_colors = [THEME["utilidad"] if v >= 0 else THEME["gastos"] for v in dff["Margen_Neto_Pct"]]
-        fig3 = go.Figure(go.Bar(
+        fig3 = go.Figure()
+        if selected_scenario != "Actual":
+            fig3.add_trace(go.Bar(
+                x=actual_compare_dff["Mes"], y=actual_compare_dff["Margen_Neto_Pct"],
+                marker=dict(color="rgba(148,163,184,0.45)", cornerradius=4),
+                name="Margen Actual",
+                hovertemplate="<b>%{x}</b><br>Margen Actual: %{y:.1f}%<extra></extra>",
+            ))
+        fig3.add_trace(go.Bar(
             x=dff["Mes"], y=dff["Margen_Neto_Pct"],
             marker=dict(color=bar_colors, cornerradius=4),
+            name="Margen Escenario" if selected_scenario != "Actual" else "Margen Neto",
             hovertemplate="<b>%{x}</b><br>Margen neto: %{y:.1f}%<extra></extra>",
         ))
         fig3.add_hline(y=0, line_dash="dot", line_color=THEME["dim"], line_width=1)
@@ -1140,6 +1208,14 @@ with tab_analisis:
             marker=dict(size=7),
             hovertemplate="Ventas: $%{y:,.0f}<extra></extra>",
         ))
+        if selected_scenario != "Actual":
+            fig_be.add_trace(go.Scatter(
+                x=actual_compare_dff["Mes"], y=actual_compare_dff["Ventas"], name="Ventas Actual",
+                mode="lines+markers",
+                line=dict(color="rgba(148,163,184,0.8)", width=2, dash="dot"),
+                marker=dict(size=6),
+                hovertemplate="Ventas Actual: $%{y:,.0f}<extra></extra>",
+            ))
         fig_be.add_trace(go.Scatter(
             x=dff["Mes"], y=dff["Break_Even"], name="Punto de equilibrio",
             mode="lines+markers",
@@ -1301,43 +1377,62 @@ with tab_detalle:
         st.markdown("""
         <div class="section-block">
             <div class="section-header">
-                <p class="section-title">Desglose del Escenario</p>
-                <p class="section-desc">Composición mensual de costos y gastos proyectados</p>
+                <p class="section-title">Scenario vs Actual</p>
+                <p class="section-desc">Comparativo mensual entre el escenario proyectado y el caso real</p>
             </div>
         </div>
         """, unsafe_allow_html=True)
         scenario_scope = scenario_monthly[scenario_monthly["Mes"].isin(sel)].copy() if sel else scenario_monthly.copy()
-        scen_detail = scenario_scope[[
-            "Mes", "Ventas_30M", "Costos_30M", "MO_30M", "Electricidad_30M", "Logistica_30M",
-            "Marketing_30M", "Fin_30M", "Otros_30M", "Gastos_30M", "Utilidad_30M", "Margen_30M_Pct",
-        ]].rename(columns={
+        actual_scope = base_dff[base_dff["Mes"].isin(sel)].copy() if sel else base_dff.copy()
+        scen_detail = (
+            scenario_scope[["Mes_Num", "Mes", "Ventas_30M", "Costos_30M", "Gastos_30M", "Utilidad_30M", "Margen_30M_Pct"]]
+            .merge(
+                actual_scope[["Mes_Num", "Ventas", "Costos", "Gastos", "Utilidad", "Margen_Neto_Pct"]],
+                on="Mes_Num",
+                how="left",
+            )
+            .sort_values("Mes_Num")
+        )
+        scen_detail["Delta Ventas"] = scen_detail["Ventas_30M"] - scen_detail["Ventas"]
+        scen_detail["Delta Utilidad"] = scen_detail["Utilidad_30M"] - scen_detail["Utilidad"]
+        scen_detail["Delta Margen pp"] = scen_detail["Margen_30M_Pct"] - scen_detail["Margen_Neto_Pct"]
+        scen_detail = scen_detail.rename(columns={
             "Ventas_30M": "Ventas Escenario",
-            "Costos_30M": "Materia Prima",
-            "MO_30M": "Mano de Obra",
-            "Electricidad_30M": "Electricidad",
-            "Logistica_30M": "Logística",
-            "Marketing_30M": "Marketing",
-            "Fin_30M": "Gasto Financiero",
-            "Otros_30M": "Otros Gastos",
-            "Gastos_30M": "Gastos Totales",
+            "Costos_30M": "Costos Escenario",
+            "Gastos_30M": "Gastos Escenario",
             "Utilidad_30M": "Utilidad Escenario",
             "Margen_30M_Pct": "Margen Escenario %",
+            "Ventas": "Ventas Actual",
+            "Costos": "Costos Actual",
+            "Gastos": "Gastos Actual",
+            "Utilidad": "Utilidad Actual",
+            "Margen_Neto_Pct": "Margen Actual %",
         })
+        scen_detail = scen_detail[
+            [
+                "Mes", "Ventas Actual", "Ventas Escenario", "Delta Ventas",
+                "Utilidad Actual", "Utilidad Escenario", "Delta Utilidad",
+                "Margen Actual %", "Margen Escenario %", "Delta Margen pp",
+                "Costos Actual", "Costos Escenario", "Gastos Actual", "Gastos Escenario",
+            ]
+        ]
         st.dataframe(
             scen_detail,
             use_container_width=True,
             hide_index=True,
             column_config={
+                "Ventas Actual": st.column_config.NumberColumn("Ventas Actual", format="$%.2f"),
                 "Ventas Escenario": st.column_config.NumberColumn("Ventas Escenario", format="$%.2f"),
-                "Materia Prima": st.column_config.NumberColumn("Materia Prima", format="$%.2f"),
-                "Mano de Obra": st.column_config.NumberColumn("Mano de Obra", format="$%.2f"),
-                "Electricidad": st.column_config.NumberColumn("Electricidad", format="$%.2f"),
-                "Logística": st.column_config.NumberColumn("Logística", format="$%.2f"),
-                "Marketing": st.column_config.NumberColumn("Marketing", format="$%.2f"),
-                "Gasto Financiero": st.column_config.NumberColumn("Gasto Financiero", format="$%.2f"),
-                "Otros Gastos": st.column_config.NumberColumn("Otros Gastos", format="$%.2f"),
-                "Gastos Totales": st.column_config.NumberColumn("Gastos Totales", format="$%.2f"),
+                "Delta Ventas": st.column_config.NumberColumn("Delta Ventas", format="$%.2f"),
+                "Utilidad Actual": st.column_config.NumberColumn("Utilidad Actual", format="$%.2f"),
                 "Utilidad Escenario": st.column_config.NumberColumn("Utilidad Escenario", format="$%.2f"),
+                "Delta Utilidad": st.column_config.NumberColumn("Delta Utilidad", format="$%.2f"),
+                "Margen Actual %": st.column_config.NumberColumn("Margen Actual %", format="%.2f%%"),
                 "Margen Escenario %": st.column_config.NumberColumn("Margen Escenario %", format="%.2f%%"),
+                "Delta Margen pp": st.column_config.NumberColumn("Delta Margen pp", format="%.2f"),
+                "Costos Actual": st.column_config.NumberColumn("Costos Actual", format="$%.2f"),
+                "Costos Escenario": st.column_config.NumberColumn("Costos Escenario", format="$%.2f"),
+                "Gastos Actual": st.column_config.NumberColumn("Gastos Actual", format="$%.2f"),
+                "Gastos Escenario": st.column_config.NumberColumn("Gastos Escenario", format="$%.2f"),
             },
         )
